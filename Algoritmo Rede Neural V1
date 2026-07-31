@@ -1,0 +1,254 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
+
+# ---- reprodutibilidade ----
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+def load_file(filepath):
+    df = pd.read_csv(filepath, sep=';')
+    X = df.iloc[:, 2:].astype(str)
+    X = X.replace(',', '.', regex=True)
+    X = X.astype(np.float32)
+    return X.values
+
+X_fundo = load_file(
+    r"C:\Users\medua\OneDrive\Desktop\DATA_3_001_filtrado2.csv"
+)
+X_peixe = load_file(
+    r"C:\Users\medua\OneDrive\Desktop\DATA_3_001_filtrado.csv"
+)
+
+print("Fundo:", X_fundo.shape)
+print("Peixe:", X_peixe.shape)
+
+y_fundo = np.zeros(len(X_fundo), dtype=np.int64)
+y_peixe = np.ones(len(X_peixe), dtype=np.int64)
+
+X = np.vstack((X_fundo, X_peixe))
+y = np.hstack((y_fundo, y_peixe))
+
+# ---- split treino / temp (val+teste) ----
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X, y, test_size=0.3, stratify=y, random_state=SEED
+)
+
+# ---- split val / teste (metade de temp cada) ----
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.5, stratify=y_temp, random_state=SEED
+)
+
+print(f"Treino: {X_train.shape[0]} | Validação: {X_val.shape[0]} | Teste: {X_test.shape[0]}")
+
+X_train = np.expand_dims(X_train, axis=1)
+X_val = np.expand_dims(X_val, axis=1)
+X_test = np.expand_dims(X_test, axis=1)
+
+trainXT = torch.from_numpy(X_train).float()
+valXT = torch.from_numpy(X_val).float()
+testXT = torch.from_numpy(X_test).float()
+
+trainyT = torch.from_numpy(y_train).long()
+valyT = torch.from_numpy(y_val).long()
+testyT = torch.from_numpy(y_test).long()
+
+n_timesteps = X_train.shape[2]
+
+class ConvNet1D(nn.Module):
+    def __init__(self, n_timesteps):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=7),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(16, 32, kernel_size=5),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, kernel_size=3),
+            nn.ReLU(),
+            nn.MaxPool1d(2)
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, n_timesteps)
+            flatten_size = self.conv(dummy).view(1, -1).shape[1]
+
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(flatten_size, 64),   # AJUSTE: era 128 -> reduz capacidade da rede
+            nn.ReLU(),
+            nn.Dropout(0.6),               # AJUSTE: era 0.5 -> mais regularização
+            nn.Linear(64, 2)                # AJUSTE: ajustado para bater com a linha acima
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.fc(x)
+        return x
+
+model = ConvNet1D(n_timesteps=n_timesteps)
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=0.001,
+    weight_decay=1e-3   # AJUSTE: era 1e-4 -> penaliza pesos grandes mais forte
+)
+
+num_epochs = 50
+batch_size = 8
+
+# AJUSTE: parâmetros de early stopping
+PATIENCE = 10
+epochs_no_improve = 0
+
+train_loss_history = []
+train_acc_history = []
+val_loss_history = []
+val_acc_history = []
+
+total_step = len(trainXT)
+
+def evaluate(model, X, y):
+    model.eval()
+    with torch.no_grad():
+        outputs = model(X)
+        loss = criterion(outputs, y).item()
+        _, predicted = torch.max(outputs, 1)
+        acc = (predicted == y).sum().item() / y.size(0)
+    model.train()
+    return loss, acc
+
+best_val_loss = float('inf')
+best_model_state = None
+
+for epoch in range(num_epochs):
+    permutation = torch.randperm(total_step)
+
+    epoch_loss_sum = 0.0
+    correct_sum = 0
+    n_batches = 0
+
+    for i in range(0, total_step, batch_size):
+        indices = permutation[i:i+batch_size]
+        batch_x = trainXT[indices]
+        batch_y = trainyT[indices]
+
+        outputs = model(batch_x)
+        loss = criterion(outputs, batch_y)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss_sum += loss.item()
+
+        _, predicted = torch.max(outputs, 1)
+        correct = (predicted == batch_y).sum().item()
+        acc = correct / len(batch_y)
+
+        correct_sum += acc
+        n_batches += 1
+
+    epoch_train_loss = epoch_loss_sum / n_batches
+    epoch_train_acc = correct_sum / n_batches
+
+    epoch_val_loss, epoch_val_acc = evaluate(model, valXT, valyT)
+
+    train_loss_history.append(epoch_train_loss)
+    train_acc_history.append(epoch_train_acc)
+    val_loss_history.append(epoch_val_loss)
+    val_acc_history.append(epoch_val_acc)
+
+    # AJUSTE: early stopping - conta épocas sem melhora
+    if epoch_val_loss < best_val_loss:
+        best_val_loss = epoch_val_loss
+        best_model_state = model.state_dict()
+        epochs_no_improve = 0
+    else:
+        epochs_no_improve += 1
+
+    print(
+        f"Epoch {epoch+1}/{num_epochs} "
+        f"- Train Loss: {epoch_train_loss:.4f} - Train Acc: {epoch_train_acc:.4f} "
+        f"- Val Loss: {epoch_val_loss:.4f} - Val Acc: {epoch_val_acc:.4f} "
+        f"- (sem melhora há {epochs_no_improve} épocas)"
+    )
+
+    # AJUSTE: para o treino se não melhorar por PATIENCE épocas seguidas
+    if epochs_no_improve >= PATIENCE:
+        print(f"\nEarly stopping ativado na época {epoch+1} "
+              f"(sem melhora na validação há {PATIENCE} épocas)")
+        break
+
+# ---- restaura o melhor modelo (menor loss de validação) ----
+if best_model_state is not None:
+    model.load_state_dict(best_model_state)
+
+# ---- gráfico treino vs validação ----
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+axes[0].plot(train_loss_history, label='Treino')
+axes[0].plot(val_loss_history, label='Validação')
+axes[0].set_title('Loss por época')
+axes[0].set_xlabel('Epoch')
+axes[0].set_ylabel('Loss')
+axes[0].legend()
+axes[0].grid(True)
+
+axes[1].plot(train_acc_history, label='Treino')
+axes[1].plot(val_acc_history, label='Validação')
+axes[1].set_title('Acurácia por época')
+axes[1].set_xlabel('Epoch')
+axes[1].set_ylabel('Acurácia')
+axes[1].legend()
+axes[1].grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# ---- avaliação final no teste ----
+model.eval()
+with torch.no_grad():
+    test_outputs = model(testXT)
+    _, predicted = torch.max(test_outputs, 1)
+
+    total = testyT.size(0)
+    correct = (predicted == testyT).sum().item()
+    accuracy = 100 * correct / total
+
+    y_true = testyT.numpy()
+    y_pred = predicted.numpy()
+
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    cm = confusion_matrix(y_true, y_pred)
+
+    print("\n--- Avaliação no conjunto de teste ---")
+    print(f"Acurácia: {accuracy:.2f}%")
+    print(f"Precisão: {precision:.4f}")
+    print(f"Recall:   {recall:.4f}")
+    print(f"F1-score: {f1:.4f}")
+    print("Matriz de confusão:")
+    print(cm)
+
+# ---- salva o modelo treinado (checkpoint completo) ----
+checkpoint = {
+    "model_state_dict": model.state_dict(),
+    "n_timesteps": n_timesteps,
+    "class_names": {0: "fundo", 1: "peixe"},
+    "test_accuracy": accuracy,
+    "test_precision": precision,
+    "test_recall": recall,
+    "test_f1": f1,
+}
+
+torch.save(checkpoint, "modelo_convnet1d.pt")
+print("\nModelo salvo em 'modelo_convnet1d.pt'")
