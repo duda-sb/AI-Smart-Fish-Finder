@@ -1,0 +1,166 @@
+"""
+  ARQUIVOS_FUNDO  - classe não peixe
+  ARQUIVOS_RUIDO  - não peixe
+  ARQUIVOS_PEIXE  - peixe (1)
+  ARQUIVOS_MISTURADOS - sem separacao, rotulo pela regra do tempo (no caso vária conforme a profundidade do aquário, ro etc
+                                    (Tempo_us <= 2100 = peixe, > 2100 = fundo)
+
+Por padrao os misturados não entram no treino, servem so de teste numa gravacao nova
+(MISTURADOS_NO_TREINO = False).
+
+O Tempo_us nunca e feature: o modelo aprende so a for da envelope do eco
+(features_eco.py), sem depender de onde o eco esta na janela.
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+import joblib
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.metrics import classification_report, confusion_matrix, balanced_accuracy_score
+
+PASTA = r"C:\Users\medua\Desktop\Estágio"
+ARQUIVOS_FUNDO = [os.path.join(PASTA, "DATA_3009_fundo.csv")]
+ARQUIVOS_PEIXE = [os.path.join(PASTA, "DATA_3009_filtrado.xlsx")]
+ARQUIVOS_RUIDO = [os.path.join(PASTA, "ruidos_05_10-11-40_Peixes.csv")]   #caminhos para as pastas 
+ARQUIVOS_MISTURADOS = [os.path.join(PASTA, "DATA_01_10.csv")]            
+
+MISTURADOS_NO_TREINO = False   # False = so teste; True = tambem treina com eles (rotulo pela regra da profundidade
+LIMITE_FUNDO_US = 2100         # regra so para os misturados: Tempo_us > 2100 = fundo)
+BLOCO_PINGS = 30               # pings vizinhos ficam juntos no treino ou no teste
+LIMIAR = 0.5
+ARQ_MODELO = "modelo_peixe4.joblib"
+ARQ_SAIDA = "resultado_por_arquivo.xlsx"
+
+
+def ler(caminho):
+    if caminho.lower().endswith(".csv"):
+        return pd.read_csv(caminho, dtype=str, sep=None, engine="python", encoding="utf-8-sig")
+    return pd.read_excel(caminho, dtype=str)
+
+
+def para_float(df):
+    return df.apply(lambda c: pd.to_numeric(c.astype(str).str.replace(",", ".", regex=False), errors="coerce"))
+
+
+def carregar(caminho, exige_tempo):
+    if not os.path.exists(caminho):
+        raise SystemExit(f"Arquivo nao encontrado: {caminho}")
+    df = ler(caminho)
+    df.columns = df.columns.astype(str).str.replace("\ufeff", "", regex=False).str.strip()
+    cols = [c for c in df.columns if c.lower().startswith("amostra")]
+    if not cols:
+        cols = [c for c in df.columns if c.lower() not in ("numero_ping", "tempo_us")]
+    if not cols:
+        raise SystemExit(f"{caminho}: nenhuma coluna de amostra encontrada.")
+    if "Tempo_us" not in df.columns:
+        if exige_tempo:
+            raise SystemExit(f"{caminho}: falta a coluna Tempo_us (necessaria para a regra do tempo).")
+        df["Tempo_us"] = np.nan
+    num = para_float(df)
+    ok = num["Tempo_us"].notna() if exige_tempo else pd.Series(True, index=num.index)
+    num = num[ok].reset_index(drop=True)
+    A = np.nan_to_num(num[cols].to_numpy(dtype=float))
+    print(f"{os.path.basename(caminho)}: {len(A)} ecos, {A.shape[1]} amostras")
+    return A, num
+
+
+from features_eco import montar_features, PERIODO   # features por envelope (mesma pasta)
+
+
+# carrega os arquivos
+print("=== Carregando ===")
+itens = ([(c, "fundo") for c in ARQUIVOS_FUNDO] + [(c, "peixe") for c in ARQUIVOS_PEIXE] +
+         [(c, "ruido") for c in ARQUIVOS_RUIDO] + [(c, "misto") for c in ARQUIVOS_MISTURADOS])
+Xs, metas = [], []
+for k, (caminho, tipo) in enumerate(itens):
+    A, num = carregar(caminho, exige_tempo=(tipo == "misto"))
+    Xs.append(montar_features(A))
+    ping = num["Numero_Ping"].fillna(0).astype(int).values if "Numero_Ping" in num.columns else np.arange(len(num))
+    metas.append(pd.DataFrame({
+        "origem": os.path.basename(caminho), "tipo": tipo, "Numero_Ping": ping,
+        "Tempo_us": num["Tempo_us"].values, "grupo": [f"{k}_{b}" for b in ping // BLOCO_PINGS],
+    }))
+X = pd.concat(Xs, ignore_index=True)
+meta = pd.concat(metas, ignore_index=True)
+
+y = (meta["tipo"] == "peixe").astype(int)
+eh_misto = (meta["tipo"] == "misto").values
+y[eh_misto] = (meta.loc[eh_misto, "Tempo_us"] <= LIMITE_FUNDO_US).astype(int)
+meta["real"] = np.where(eh_misto, np.where(y == 1, "peixe (regra)", "fundo (regra)"), meta["tipo"])
+
+print("\n=== Rotulos ===")
+print(pd.crosstab(meta["origem"], meta["real"]))
+if (y == 1).sum() < 50 or (y == 0).sum() < 50:
+    raise SystemExit("Poucos exemplos em uma das classes. Confira os arquivos.")
+
+# divisão dos dados 
+if MISTURADOS_NO_TREINO or not eh_misto.any():
+    base, extra = np.arange(len(X)), np.array([], dtype=int)
+else:
+    base, extra = np.where(~eh_misto)[0], np.where(eh_misto)[0]
+
+gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+tr_i, te_i = next(gss.split(X.iloc[base], y.iloc[base], groups=meta["grupo"].iloc[base]))
+tr, te = base[tr_i], base[te_i]
+print(f"\nTreino: {len(tr)} ecos | teste (mesmas gravacoes, blocos novos): {len(te)} ecos"
+      + (f" | teste em gravacao nova (misturados): {len(extra)} ecos" if len(extra) else ""))
+
+# treinamento 
+
+modelo = lgb.LGBMClassifier(
+    n_estimators=400, learning_rate=0.05, num_leaves=15, min_child_samples=20,
+    subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
+    class_weight="balanced", random_state=42, verbose=-1,
+)
+modelo.fit(X.iloc[tr], y.iloc[tr], eval_set=[(X.iloc[te], y.iloc[te])],
+           callbacks=[lgb.early_stopping(30, verbose=False)])
+
+
+def relatorio(titulo, idx):
+    prob = modelo.predict_proba(X.iloc[idx])[:, 1]
+    pred = (prob >= LIMIAR).astype(int)
+    yy = y.iloc[idx].values
+    print(f"\n=== {titulo}: {len(idx)} ecos ===")
+    print("Matriz de confusao (linhas=real, colunas=previsto) [nao peixe, peixe]:")
+    print(confusion_matrix(yy, pred, labels=[0, 1]))
+    print(classification_report(yy, pred, labels=[0, 1], target_names=["nao peixe", "peixe"], zero_division=0))
+    orig = meta["origem"].iloc[idx].values
+    for o in pd.unique(orig):
+        m = orig == o
+        print(f"  {o}: acerto {(pred[m] == yy[m]).mean():.1%} | marcados como peixe {pred[m].mean():.1%} ({m.sum()} ecos)")
+    return prob
+
+
+prob_te = relatorio("TESTE nas gravacoes de treino (blocos nunca vistos)", te)
+if len(extra):
+    relatorio("TESTE em gravacao nova (misturados, rotulo pela regra do tempo)", extra)
+
+print("\nLimiar x acerto balanceado (teste principal):")
+melhor = (0.5, 0)
+for t in [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+    b = balanced_accuracy_score(y.iloc[te], (prob_te >= t).astype(int))
+    print(f"  {t:.1f}: {b:.3f}")
+    if b > melhor[1]:
+        melhor = (t, b)
+print(f"Melhor limiar: {melhor[0]} (acerto balanceado {melhor[1]:.3f})")
+
+imp = pd.Series(modelo.feature_importances_, index=X.columns).sort_values(ascending=False)
+print("\nFeatures mais importantes:\n", imp.head(8))
+
+# salva o modelo treinado 
+
+joblib.dump({"modelo": modelo, "colunas": list(X.columns), "periodo": PERIODO,
+             "limite_fundo_us": LIMITE_FUNDO_US}, ARQ_MODELO)
+
+prob_all = modelo.predict_proba(X)[:, 1]
+saida = meta.drop(columns="grupo").copy()
+saida["prob_peixe"] = prob_all.round(4)
+saida["classe"] = np.where(prob_all >= LIMIAR, "peixe", "fundo/ruido")
+saida["acertou"] = np.where((prob_all >= LIMIAR) == (y.values == 1), "SIM", "NÃO")
+saida["usado_no_treino"] = False
+saida.loc[saida.index[tr], "usado_no_treino"] = True
+saida.to_excel(ARQ_SAIDA, index=False)
+print(f"\nModelo salvo em {ARQ_MODELO}")
+print(f"Resultado salvo em {ARQ_SAIDA} (meca acerto so nas linhas com usado_no_treino = FALSO)")
