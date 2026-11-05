@@ -1,0 +1,162 @@
+"""
+XGBoost para Pings de Sonar - Versão com Janela Completa (1024 Amostras)
+========================================================================
+Objetivo: Capturar a cauda longa do eco do fundo e manter invariância de ganho.
+"""
+
+import warnings
+import itertools
+import joblib
+import numpy as np
+import pandas as pd
+from scipy.signal import find_peaks
+from scipy.stats import skew, kurtosis
+
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
+
+warnings.filterwarnings("ignore")
+
+# ----------------------------------------------------------------------
+# CONFIGURAÇÃO
+# ----------------------------------------------------------------------
+COL_PING = "Numero_Ping"
+PREFIXO_AMOSTRA = "Amostra_"
+CLASSES = ["ruido", "peixe", "fundo"]
+
+# Ajuste dos caminhos dos arquivos base de treino:
+ARQUIVOS = {
+    "ruido": [r"C:\Users\medua\Desktop\Estágio\FISH_FINDER\DADOS FISH FINDER - NOVEMBRO\DADOS CSV\ruidos_05_10-11-40_Peixes.csv"],
+    "peixe": [r"C:\Users\medua\Desktop\Estágio\FISH_FINDER\DADOS FISH FINDER - NOVEMBRO\DADOS CSV\1610_1140_PEIXE_filtrado .xlsx"],
+    "fundo": [r"C:\Users\medua\Desktop\Estágio\FISH_FINDER\DADOS FISH FINDER - NOVEMBRO\DADOS CSV\1610_1140_FUNDO2.csv"],
+}
+
+# JANELA COMPLETA DO ECO
+JANELA = 512  # 512 para a esquerda + 512 para a direita = 1025 amostras totais
+
+def ler_arquivo(caminho):
+    if str(caminho).lower().endswith((".xlsx", ".xls")):
+        d = pd.read_excel(caminho)
+    else:
+        d = pd.read_csv(caminho, sep=None, engine="python", encoding="utf-8-sig")
+    
+    d.columns = [str(c).strip() for c in d.columns]
+    d = d.dropna(subset=[COL_PING])
+    cols_a = [c for c in d.columns if c.startswith(PREFIXO_AMOSTRA)]
+    
+    for c in cols_a:
+        if d[c].dtype == object:
+            d[c] = d[c].astype(str).str.strip().str.replace(",", ".", regex=False)
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+        
+    d[cols_a] = d[cols_a].fillna(0.0)
+    return d
+
+partes, amostra_cols = [], None
+for i, classe in enumerate(CLASSES):
+    for idx_arq, caminho in enumerate(ARQUIVOS[classe]):
+        d = ler_arquivo(caminho)
+        d = d.drop_duplicates(subset=COL_PING).sort_values(COL_PING)
+        d["classe_idx"] = i
+        d["origem"] = f"{classe}_{idx_arq}"
+        if amostra_cols is None:
+            amostra_cols = [c for c in d.columns if c.startswith(PREFIXO_AMOSTRA)]
+        partes.append(d)
+
+df = pd.concat(partes, ignore_index=True)
+y = df["classe_idx"].to_numpy()
+
+# ----------------------------------------------------------------------
+# EXTRAÇÃO DE FEATURES DE JANELA DE 1024 AMOSTRAS
+# ----------------------------------------------------------------------
+def extrair_janela_completa(df_sub):
+    A = df_sub[amostra_cols].to_numpy(dtype=float)
+    n, m = A.shape
+    mx = np.maximum(A.max(axis=1), 1e-9)
+    idx = A.argmax(axis=1)
+    
+    # Normalização
+    An = A / mx[:, None]
+
+    # Matriz recortada com Janela de 1024 amostras
+    W = np.zeros((n, 2 * JANELA + 1))
+    for i in range(n):
+        ini, fim = idx[i] - JANELA, idx[i] + JANELA + 1
+        a0, a1 = max(ini, 0), min(fim, m)
+        W[i, a0 - ini: a0 - ini + (a1 - a0)] = An[i, a0:a1]
+
+    # Features de Forma Físicas (Capturam a Cauda do Fundo)
+    largura_50 = (W >= 0.5).sum(axis=1)
+    largura_20 = (W >= 0.2).sum(axis=1)
+    largura_10 = (W >= 0.1).sum(axis=1)
+    
+    ant = W[:, :JANELA].sum(axis=1)
+    dep = W[:, JANELA+1:].sum(axis=1)
+    
+    # Energia acumulada na cauda estendida (Fundamental para identificar Fundo)
+    energia_cauda_longa = W[:, JANELA+50:].sum(axis=1)
+    
+    F = pd.DataFrame({
+        "largura_50": largura_50,
+        "largura_20": largura_20,
+        "largura_10": largura_10,
+        "energia_cauda_longa": energia_cauda_longa,
+        "razao_ant_dep": ant / np.maximum(dep, 1e-9),
+        "skew_local": skew(W, axis=1),
+        "kurt_local": kurtosis(W, axis=1),
+    }, index=df_sub.index)
+
+    eco_cols = [f"eco_{k:+d}" for k in range(-JANELA, JANELA + 1)]
+    return pd.concat([F, pd.DataFrame(W, columns=eco_cols, index=df_sub.index)], axis=1)
+
+print("A extrair janela completa de 1024 amostras...")
+X = pd.concat([extrair_janela_completa(g) for _, g in df.groupby("origem", sort=False)]).loc[df.index]
+
+# ----------------------------------------------------------------------
+# SPLIT TEMPORAL CONTÍNUO E TREINO
+# ----------------------------------------------------------------------
+m_tr, m_te = np.zeros(len(df), dtype=bool), np.zeros(len(df), dtype=bool)
+for _, g in df.groupby("origem"):
+    idx = g.index.to_numpy()
+    n_tr = int(len(idx) * 0.70)
+    m_tr[idx[:n_tr]] = True
+    m_te[idx[n_tr:]] = True
+
+X_tr, y_tr = X[m_tr], y[m_tr]
+X_te, y_te = X[m_te], y[m_te]
+
+# Escalonamento
+scaler = StandardScaler()
+X_tr_sc = scaler.fit_transform(X_tr)
+X_te_sc = scaler.transform(X_te)
+
+# Modelo XGBoost com hiperparâmetros regularizados
+modelo = XGBClassifier(
+    n_estimators=150,
+    learning_rate=0.03,
+    max_depth=3,
+    subsample=0.7,
+    colsample_bytree=0.7,
+    random_state=42,
+    n_jobs=-1
+)
+modelo.fit(X_tr_sc, y_tr)
+
+# Avaliação
+pred = modelo.predict(X_te_sc)
+print("\n--- AVALIAÇÃO DO TREINO (JANELA COMPLETA DE 1024 AMOSTRAS) ---")
+print(classification_report(y_te, pred, target_names=CLASSES, digits=3))
+
+# Salva o novo pacote do modelo
+pacote = {
+    "modelo": modelo,
+    "scaler": scaler,
+    "classes": CLASSES,
+    "colunas": list(X.columns),
+    "config": {
+        "JANELA": JANELA,
+    },
+}
+joblib.dump(pacote, "modelo_eco_peixe_1024.joblib")
+print("Novo modelo salvo com sucesso em: 'modelo_eco_peixe_1024.joblib'")
