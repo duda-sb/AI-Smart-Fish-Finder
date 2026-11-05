@@ -1,0 +1,194 @@
+"""
+Treino do RandomForest com 1024 Amostras e Exportação para C (STM32 / TinyML)
+=============================================================================
+"""
+
+import warnings
+import joblib
+import m2cgen as m2c
+import numpy as np
+import pandas as pd
+from scipy.stats import skew, kurtosis
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore")
+
+# ----------------------------------------------------------------------
+# 1. CONFIGURAÇÕES E LEITURA
+# ----------------------------------------------------------------------
+COL_PING = "Numero_Ping"
+PREFIXO_AMOSTRA = "Amostra_"
+CLASSES = ["ruido", "peixe", "fundo"]
+JANELA = 512  # Janela total = 1025 pontos (±512 em redor do pico)
+
+ARQUIVOS = {
+    "ruido": [
+        r"C:\Users\medua\Desktop\Estágio\FISH_FINDER\DADOS FISH FINDER - NOVEMBRO\DADOS CSV\ruidos_05_10-11-40_Peixes.csv"
+    ],
+    "peixe": [
+        r"C:\Users\medua\Desktop\Estágio\FISH_FINDER\DADOS FISH FINDER - NOVEMBRO\DADOS CSV\1610_1140_PEIXE_filtrado .xlsx"
+    ],
+    "fundo": [
+        r"C:\Users\medua\Desktop\Estágio\FISH_FINDER\DADOS FISH FINDER - NOVEMBRO\DADOS CSV\1610_1140_FUNDO2.csv"
+    ],
+}
+
+
+def ler_arquivo(caminho):
+    if str(caminho).lower().endswith((".xlsx", ".xls")):
+        d = pd.read_excel(caminho)
+    else:
+        d = pd.read_csv(
+            caminho, sep=None, engine="python", encoding="utf-8-sig"
+        )
+
+    d.columns = [str(c).strip() for c in d.columns]
+    d = d.dropna(subset=[COL_PING])
+    cols_a = [c for c in d.columns if c.startswith(PREFIXO_AMOSTRA)]
+
+    for c in cols_a:
+        if d[c].dtype == object:
+            d[c] = (
+                d[c].astype(str).str.strip().str.replace(",", ".", regex=False)
+            )
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    d[cols_a] = d[cols_a].fillna(0.0)
+    return d
+
+
+partes, amostra_cols = [], None
+for i, classe in enumerate(CLASSES):
+    for idx_arq, caminho in enumerate(ARQUIVOS[classe]):
+        d = ler_arquivo(caminho)
+        d = d.drop_duplicates(subset=COL_PING).sort_values(COL_PING)
+        d["classe_idx"] = i
+        d["origem"] = f"{classe}_{idx_arq}"
+        if amostra_cols is None:
+            amostra_cols = [
+                c for c in d.columns if c.startswith(PREFIXO_AMOSTRA)
+            ]
+        partes.append(d)
+
+df = pd.concat(partes, ignore_index=True)
+y = df["classe_idx"].to_numpy()
+
+
+# ----------------------------------------------------------------------
+# 2. EXTRAÇÃO DA JANELA DE 1024 AMOSTRAS
+# ----------------------------------------------------------------------
+def extrair_janela_completa(df_sub):
+    A = df_sub[amostra_cols].to_numpy(dtype=float)
+    n, m = A.shape
+    mx = np.maximum(A.max(axis=1), 1e-9)
+    idx = A.argmax(axis=1)
+
+    An = A / mx[:, None]
+
+    W = np.zeros((n, 2 * JANELA + 1))
+    for i in range(n):
+        ini, fim = idx[i] - JANELA, idx[i] + JANELA + 1
+        a0, a1 = max(ini, 0), min(fim, m)
+        W[i, a0 - ini : a0 - ini + (a1 - a0)] = An[i, a0:a1]
+
+    largura_50 = (W >= 0.5).sum(axis=1)
+    largura_20 = (W >= 0.2).sum(axis=1)
+    largura_10 = (W >= 0.1).sum(axis=1)
+
+    ant = W[:, :JANELA].sum(axis=1)
+    dep = W[:, JANELA + 1 :].sum(axis=1)
+    energia_cauda_longa = W[:, JANELA + 50 :].sum(axis=1)
+
+    F = pd.DataFrame(
+        {
+            "largura_50": largura_50,
+            "largura_20": largura_20,
+            "largura_10": largura_10,
+            "energia_cauda_longa": energia_cauda_longa,
+            "razao_ant_dep": ant / np.maximum(dep, 1e-9),
+            "skew_local": skew(W, axis=1),
+            "kurt_local": kurtosis(W, axis=1),
+        },
+        index=df_sub.index,
+    )
+
+    eco_cols = [f"eco_{k:+d}" for k in range(-JANELA, JANELA + 1)]
+    return pd.concat(
+        [F, pd.DataFrame(W, columns=eco_cols, index=df_sub.index)], axis=1
+    )
+
+
+print("Extraindo janela de 1024 amostras...")
+X = pd.concat(
+    [extrair_janela_completa(g) for _, g in df.groupby("origem", sort=False)]
+).loc[df.index]
+
+# ----------------------------------------------------------------------
+# 3. SPLIT TEMPORAL E TREINAMENTO RANDOM FOREST
+# ----------------------------------------------------------------------
+m_tr, m_te = np.zeros(len(df), dtype=bool), np.zeros(len(df), dtype=bool)
+for _, g in df.groupby("origem"):
+    idx = g.index.to_numpy()
+    n_tr = int(len(idx) * 0.70)
+    m_tr[idx[:n_tr]] = True
+    m_te[idx[n_tr:]] = True
+
+X_tr, y_tr = X[m_tr], y[m_tr]
+X_te, y_te = X[m_te], y[m_te]
+
+scaler = StandardScaler()
+X_tr_sc = scaler.fit_transform(X_tr)
+X_te_sc = scaler.transform(X_te)
+
+# Treino do RandomForest (otimizado para STM32: 30 árvores, profundidade máxima 6)
+modelo_rf = RandomForestClassifier(
+    n_estimators=30, max_depth=6, random_state=42, n_jobs=-1
+)
+modelo_rf.fit(X_tr_sc, y_tr)
+
+pred = modelo_rf.predict(X_te_sc)
+print("\n--- AVALIAÇÃO RANDOM FOREST ---")
+print(classification_report(y_te, pred, target_names=CLASSES, digits=3))
+
+# ----------------------------------------------------------------------
+# 4. EXPORTAÇÃO NATIVA PARA C (STM32)
+# ----------------------------------------------------------------------
+print("\nGerando código C nativo com m2cgen...")
+code_c = m2c.export_to_c(modelo_rf)
+
+# Salva modelo_sonar.c
+with open("modelo_sonar.c", "w") as f:
+    f.write('#include "modelo_sonar.h"\n\n')
+    f.write(code_c)
+
+# Formata constantes do StandardScaler
+mean_values = ", ".join([f"{x:.8f}f" for x in scaler.mean_])
+scale_values = ", ".join([f"{x:.8f}f" for x in scaler.scale_])
+
+header_code = f"""#ifndef MODELO_SONAR_H
+#define MODELO_SONAR_H
+
+#include <math.h>
+
+#define NUM_FEATURES {len(scaler.mean_)}
+#define NUM_CLASSES {len(CLASSES)}
+
+// Parâmetros do StandardScaler calibrado para o STM32
+static const float SCALER_MEAN[NUM_FEATURES] = {{{mean_values}}};
+static const float SCALER_SCALE[NUM_FEATURES] = {{{scale_values}}};
+
+// Função de inferência gerada automaticamente pelo m2cgen
+void score(double *input, double *output);
+
+#endif // MODELO_SONAR_H
+"""
+
+# Salva modelo_sonar.h
+with open("modelo_sonar.h", "w") as f:
+    f.write(header_code)
+
+print(
+    "\nSUCESSO! Arquivos 'modelo_sonar.c' e 'modelo_sonar.h' foram criados."
+)
